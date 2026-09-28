@@ -1,5 +1,7 @@
 const Parser = require('rss-parser');
 const { extract } = require('@extractus/article-extractor');
+const { matchByKeywords, DEFAULT_TAG } = require('./tagger');
+const { tagByLLM } = require('./llm-tagger');
 
 const rssParser = new Parser();
 
@@ -42,6 +44,62 @@ async function enrichWithArticleExtractor(items) {
   }
 
   console.log(`  完成: 成功 ${successCount}/${items.length}`);
+  return items;
+}
+
+// ======================== 打标签 ========================
+/**
+ * 把标签结果写入 item
+ * result 形如 { tag, name }
+ */
+function applyTag(item, result, source) {
+  item.tag = result.tag;
+  item.tagName = result.name;
+  item.tagSource = source;
+  return item;
+}
+
+/**
+ * 给一批新闻打标签
+ * 1. 先用关键词匹配标题
+ * 2. 匹配不上再调用大模型识别
+ * 3. 都失败则用默认标签「综合」
+ */
+async function tagItems(items) {
+  let keywordCount = 0;
+  let llmCount = 0;
+  let defaultCount = 0;
+
+  // 关键词匹配是同步的，先全部跑一遍；需要 LLM 的收集起来
+  const needLLM = [];
+  for (const item of items) {
+    const keywordTag = matchByKeywords(item.title);
+    if (keywordTag) {
+      applyTag(item, keywordTag, 'keyword');
+      keywordCount++;
+    } else {
+      needLLM.push(item);
+    }
+  }
+
+  // 对关键词没匹配上的，调用大模型（串行，避免并发过高）
+  if (needLLM.length > 0) {
+    console.log(`  关键词匹配 ${keywordCount} 条，${needLLM.length} 条交给大模型识别...`);
+    for (const item of needLLM) {
+      const llmTag = await tagByLLM(item.title);
+      if (llmTag) {
+        applyTag(item, llmTag, 'llm');
+        llmCount++;
+      } else {
+        applyTag(item, DEFAULT_TAG, 'default');
+        defaultCount++;
+      }
+    }
+  } else {
+    console.log(`  全部 ${keywordCount} 条均由关键词匹配完成，无需大模型`);
+  }
+
+  console.log(`  打标签完成: 关键词 ${keywordCount}, 大模型 ${llmCount}, 默认 ${defaultCount}`);
   return items;
 }
 
@@ -121,6 +179,13 @@ async function fetchAll() {
       console.log(`[${allResults[i].source}]`);
       allResults[i].items = await enrichWithArticleExtractor(allResults[i].items);
     }
+  }
+
+  // 给所有新闻打标签
+  for (const result of allResults) {
+    if (result.error || result.items.length === 0) continue;
+    console.log(`[${result.source}] 打标签`);
+    result.items = await tagItems(result.items);
   }
 
   return allResults;
